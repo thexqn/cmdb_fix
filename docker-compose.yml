@@ -62,6 +62,7 @@ services:
         /wait
         flask db-setup
         flask common-check-new-columns
+        flask cmdb-release-redis-locks --no-dry-run
         gunicorn --workers=4 autoapp:app -b 0.0.0.0:5000 -D
         
         celery -A celery_worker.celery worker -E -Q one_cmdb_async --autoscale=4,1 --logfile=one_cmdb_async.log -D

@@ -45,6 +45,7 @@ from api.models.cmdb import CITypeTrigger
 from api.models.cmdb import OperationRecord
 from api.models.cmdb import PreferenceRelationView
 from api.tasks.cmdb import batch_ci_cache
+import psutil
 
 
 @click.command()
@@ -587,3 +588,94 @@ def cmdb_patch(version):
             batch_ci_cache.apply_async(args=(ci_ids,))
     except Exception as e:
         print("cmdb patch failed: {}".format(e))
+
+
+@click.command()
+@click.option(
+    '--dry-run/--no-dry-run',
+    default=True,
+    help='Preview only: show locks to be cleaned and count; use --no-dry-run to execute deletion')
+@with_appcontext
+def cmdb_release_redis_locks(dry_run):
+    """
+    Clean suspected zombie locks in Redis: delete all lock:* keys with TTL == -1.
+
+    - Default to --dry-run preview, no deletion
+    - Use --no-dry-run for actual deletion (UNLINK)
+    - Execute only before app/worker startup to avoid affecting running instances
+    """
+    try:
+        # Force dry-run if gunicorn/celery processes are detected running
+        running = []
+        for p in psutil.process_iter(['name', 'cmdline']):
+            name = (p.info.get('name') or '').lower()
+            cmd = ' '.join(p.info.get('cmdline') or []).lower()
+            if 'gunicorn' in name or 'gunicorn' in cmd or 'celery' in name or 'celery' in cmd:
+                running.append("{}({})".format(name or 'proc', p.pid))
+        if running and not dry_run:
+            dry_run = True
+            click.echo(click.style(
+                'Detected running processes: {}, automatically switched to dry-run mode'
+                .format(', '.join(running[:5])), fg='yellow'))
+
+        r = rd.r
+        scan_match = "lock:*"
+        scan_count = 1000
+        ttl_check_batch_size = 500
+        delete_batch_size = 500
+
+        candidate_keys = []
+        # SCAN iteration to avoid blocking
+        for key in r.scan_iter(match=scan_match, count=scan_count):
+            candidate_keys.append(key)
+
+        if not candidate_keys:
+            click.echo(click.style('No lock:* keys found, no cleanup needed.', fg='green'))
+            return
+
+        # Batch TTL check, keep only keys with TTL == -1
+        stale_keys = []
+        for i in range(0, len(candidate_keys), ttl_check_batch_size):
+            batch = candidate_keys[i:i + ttl_check_batch_size]
+            pipe = r.pipeline()
+            for k in batch:
+                pipe.ttl(k)
+            ttls = pipe.execute()
+            for k, ttl in zip(batch, ttls):
+                if ttl == -1:
+                    stale_keys.append(k)
+
+        if not stale_keys:
+            click.echo(click.style('No lock keys with TTL==-1 found, no cleanup needed.', fg='green'))
+            return
+
+        # Display summary and partial examples
+        def _kstr(x):
+            return x.decode('utf-8') if isinstance(x, (bytes, bytearray)) else str(x)
+
+        sample_preview = ', '.join(_kstr(k) for k in stale_keys[:20])
+        click.echo(click.style(
+            'Found {} suspected zombie locks (showing first 20 only):'
+            .format(len(stale_keys)), fg='yellow'))
+        if sample_preview:
+            click.echo(sample_preview)
+
+        if dry_run:
+            click.echo(click.style('Dry-run mode: No deletion executed. To delete, add --no-dry-run.', fg='blue'))
+            return
+
+        # Actual deletion: UNLINK (asynchronous deletion)
+        deleted_total = 0
+        pipe = r.pipeline()
+        for i in range(0, len(stale_keys), delete_batch_size):
+            batch = stale_keys[i:i + delete_batch_size]
+            pipe.unlink(*batch)
+        results = pipe.execute()
+        deleted_total = sum(results)
+
+        click.echo(click.style('Cleanup completed, deleted {} lock keys.'.format(deleted_total), fg='green'))
+    except Exception as e:
+        import traceback
+        click.echo(click.style('Exception occurred during cleanup: {}'.format(str(e)), fg='red'))
+        click.echo(traceback.format_exc())
+        raise
